@@ -1,61 +1,50 @@
-import express, { Request, Response } from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import ffmpeg from 'fluent-ffmpeg';
-import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
-import YTDlpWrap from 'yt-dlp-wrap';
+import express, { Request, Response } from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import ffmpeg from "fluent-ffmpeg";
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
+import YTDlpWrap from "yt-dlp-wrap";
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// --- Setup for yt-dlp ---
+/* ---------------- yt-dlp (SAFE) ---------------- */
 const ytDlpWrap = new YTDlpWrap();
-// On first run, this will download the yt-dlp binary into the CWD of the process.
-// For Render, this will be the project root. We can specify a path if needed.
-YTDlpWrap.getGithubReleases(1, 5).then(releases => {
-    const suitableRelease = releases.find(r => r.name.includes('yt-dlp') && !r.name.includes('zip'));
-    if (suitableRelease) {
-        YTDlpWrap.downloadFromGithub(suitableRelease.browser_download_url)
-            .then(() => console.log('yt-dlp binary downloaded successfully.'))
-            .catch(e => console.error('Failed to download yt-dlp binary:', e));
-    }
-});
 
-
-// --- Gemini AI Setup ---
+/* ---------------- Gemini AI ---------------- */
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
-  console.warn('WARNING: GEMINI_API_KEY is not set. AI features will be disabled.');
+  console.warn("WARNING: GEMINI_API_KEY is not set. AI features disabled.");
 }
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || 'disabled');
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-const generationConfig = {
-  temperature: 0.5,
-  topP: 0.95,
-  topK: 64,
-  maxOutputTokens: 8192,
-  responseMimeType: 'application/json',
-};
-const safetySettings = [
-  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-];
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || "disabled");
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// --- Middleware ---
-app.use(cors());
+/* ---------------- Middleware ---------------- */
+app.use(
+  cors({
+    origin: [
+      "http://localhost:8080",
+      "https://silver-nightingale-507266.hostingersite.com",
+    ],
+    methods: ["GET", "POST"],
+  })
+);
+
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // To parse form data
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+app.use(express.urlencoded({ extended: true }));
 
+/* ---------------- Storage ---------------- */
+const uploadDir = path.join(__dirname, "..", "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
-// --- In-Memory Database ---
+app.use("/uploads", express.static(uploadDir));
+
+/* ---------------- DB (in-memory) ---------------- */
 interface Clip {
   id: string;
   projectId: string;
@@ -65,197 +54,198 @@ interface Clip {
   url: string;
 }
 interface Project {
-  id:string;
+  id: string;
   userId: string;
   title: string;
   fileName: string;
-  status: 'processing' | 'completed' | 'failed';
+  status: "processing" | "completed" | "failed";
   clips: Clip[];
   createdAt: Date;
   errorMessage?: string;
 }
 const projects: Project[] = [];
-const users = [{ id: 'mock-user-id', email: 'user@example.com' }];
+const users = [{ id: "mock-user-id", email: "user@example.com" }];
 
-// --- Multer Setup for video uploads ---
-const uploadDir = path.join(__dirname, '..', 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+/* ---------------- Upload ---------------- */
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + '-' + file.originalname);
-  },
+  destination: (_, __, cb) => cb(null, uploadDir),
+  filename: (_, file, cb) =>
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${file.originalname}`),
 });
-const upload = multer({ storage: storage, limits: { fileSize: 1024 * 1024 * 500 } }); // 500MB limit
+const upload = multer({
+  storage,
+  limits: { fileSize: 1024 * 1024 * 500 },
+});
 
-
-// --- Simplified Auth Middleware ---
-const simpleAuth = (req: Request, res: Response, next: Function) => {
+/* ---------------- Auth ---------------- */
+const simpleAuth = (req: Request, _res: Response, next: Function) => {
   (req as any).user = users[0];
   next();
 };
 
-// --- API Endpoints ---
-app.get('/api', (req, res) => res.send('AutoShorts AI backend is running!'));
-
-app.get('/api/projects', simpleAuth, (req, res) => {
-  const userId = (req as any).user.id;
-  const userProjects = projects.filter(p => p.userId === userId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-  res.status(200).json(userProjects);
-});
-
-app.get('/api/projects/:id', simpleAuth, (req, res) => {
-  const project = projects.find(p => p.id === req.params.id);
-  if (!project) return res.status(404).json({ message: 'Project not found' });
-  if (project.userId !== (req as any).user.id) return res.status(403).json({ message: 'Forbidden' });
-  res.status(200).json(project);
-});
-
-const getVideoDuration = (filePath: string): Promise<number> => new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-        if (err) return reject(new Error(`FFprobe error: ${err.message}`));
-        const duration = metadata.format.duration;
-        if (duration === undefined) return reject(new Error('Could not determine video duration.'));
-        resolve(duration);
+/* ---------------- Utils ---------------- */
+const getVideoDuration = (filePath: string): Promise<number> =>
+  new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, meta) => {
+      if (err) return reject(err);
+      if (!meta.format.duration) return reject(new Error("Duration not found"));
+      resolve(meta.format.duration);
     });
-});
-
-app.post('/api/projects', simpleAuth, upload.single('videoFile'), async (req, res) => {
-  const { title, youtubeUrl } = req.body;
-  const videoFile = req.file;
-
-  if (!videoFile && !youtubeUrl) {
-    return res.status(400).json({ message: 'No video file or YouTube URL provided.' });
-  }
-
-  const userId = (req as any).user.id;
-  const projectId = `proj-${Date.now()}`;
-  
-  let tempVideoPath: string | null = null; // For cleaning up YT downloads
-
-  try {
-    let sourcePath: string;
-    let originalFileName: string;
-
-    if (videoFile) {
-        console.log(`[${projectId}] Processing uploaded file: ${videoFile.originalname}`);
-        sourcePath = videoFile.path;
-        originalFileName = videoFile.originalname;
-    } else {
-        console.log(`[${projectId}] Processing YouTube URL: ${youtubeUrl}`);
-        if (!/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/.test(youtubeUrl)) {
-            throw new Error('Invalid YouTube URL provided.');
-        }
-        
-        const downloadPath = path.join(uploadDir, `${projectId}.%(ext)s`);
-        tempVideoPath = await new Promise<string>((resolve, reject) => {
-            let resolvedPath: string;
-            const process = ytDlpWrap.exec([
-                youtubeUrl,
-                '-f', 'best[ext=mp4]', // Get best quality MP4
-                '-o', downloadPath,
-            ]);
-            process.on('progress', (progress) => console.log(`[${projectId}] Downloading: ${progress.percent}%`));
-            process.on('yt-dlp-exec-data', (data) => {
-                if (data.includes('Destination:')) {
-                    resolvedPath = data.split('Destination:')[1].trim();
-                }
-            });
-            process.on('close', (code) => {
-                if (code === 0) resolve(resolvedPath);
-                else reject(new Error(`yt-dlp exited with code ${code}`));
-            });
-            process.on('error', err => reject(err));
-        });
-        sourcePath = tempVideoPath;
-        originalFileName = youtubeUrl;
-    }
-
-    const newProject: Project = {
-      id: projectId,
-      userId,
-      title: title || originalFileName,
-      fileName: path.basename(sourcePath),
-      status: 'processing',
-      clips: [],
-      createdAt: new Date(),
-    };
-    projects.push(newProject);
-    res.status(201).json(newProject);
-    
-    // --- Async processing ---
-    const duration = await getVideoDuration(sourcePath);
-    console.log(`[${projectId}] Video duration: ${duration}s`);
-    let generatedClips: { title: string; start: number; end: number; }[] = [];
-
-    if (GEMINI_API_KEY) {
-      try {
-        console.log(`[${projectId}] Calling Gemini API...`);
-        const prompt = `You are an expert video editor...`; // Prompt remains the same
-        const result = await model.generateContent(prompt);
-        const responseText = result.response.text();
-        const cleanedResponse = responseText.trim().replace(/^```json/, '').replace(/```$/, '').trim();
-        generatedClips = JSON.parse(cleanedResponse);
-      } catch (aiError: any) {
-        console.error(`[${projectId}] Gemini API failed: ${aiError.message}`);
-      }
-    }
-
-    if (generatedClips.length === 0) {
-      console.log(`[${projectId}] Using fallback clip generation.`);
-      const clipCount = 3, minClipDuration = 15;
-      for (let i = 0; i < clipCount; i++) {
-        const start = Math.random() * (duration - minClipDuration);
-        generatedClips.push({ title: `Random Clip ${i + 1}`, start, end: Math.min(start + minClipDuration + Math.random() * 45, duration) });
-      }
-    }
-    
-    const finalClips: Clip[] = [];
-    for (const clipData of generatedClips) {
-      const clipId = `clip-${Date.now()}-${Math.round(Math.random() * 1E4)}`;
-      const clipFileName = `${projectId}-${clipId}.mp4`;
-      const clipOutputPath = path.join(uploadDir, clipFileName);
-      await new Promise<void>((resolve, reject) => {
-        ffmpeg(sourcePath)
-          .setStartTime(clipData.start)
-          .setDuration(clipData.end - clipData.start)
-          .outputOptions('-c:v copy', '-c:a copy')
-          .output(clipOutputPath)
-          .on('end', () => {
-            finalClips.push({ id: clipId, projectId, title: clipData.title, start: clipData.start, end: clipData.end, url: `/uploads/${clipFileName}` });
-            resolve();
-          })
-          .on('error', (err) => reject(new Error(`FFMPEG clipping failed: ${err.message}`)))
-          .run();
-      });
-    }
-
-    const projectIndex = projects.findIndex(p => p.id === projectId);
-    if (projectIndex !== -1) {
-      projects[projectIndex].status = 'completed';
-      projects[projectIndex].clips = finalClips;
-    }
-
-  } catch (error: any) {
-    console.error(`[${projectId}] FAILED processing pipeline:`, error.message);
-    const projectIndex = projects.findIndex(p => p.id === projectId);
-    if (projectIndex !== -1) {
-      projects[projectIndex].status = 'failed';
-      projects[projectIndex].errorMessage = error.message;
-    }
-  } finally {
-      if (tempVideoPath && fs.existsSync(tempVideoPath)) {
-          fs.unlinkSync(tempVideoPath);
-          console.log(`[${projectId}] Cleaned up temporary file: ${tempVideoPath}`);
-      }
-  }
-});
-
-if (process.env.NODE_ENV !== 'test') {
-  app.listen(port, () => {
-    console.log(`Backend server is running on http://localhost:${port}`);
   });
+
+/* ---------------- Routes ---------------- */
+app.get("/api", (_req, res) => res.send("AutoShorts AI backend running"));
+
+app.get("/api/projects", simpleAuth, (req, res) => {
+  const uid = (req as any).user.id;
+  res.json(
+    projects
+      .filter((p) => p.userId === uid)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+  );
+});
+
+app.get("/api/projects/:id", simpleAuth, (req, res) => {
+  const p = projects.find((x) => x.id === req.params.id);
+  if (!p) return res.status(404).json({ message: "Not found" });
+  res.json(p);
+});
+
+/* ---------------- Create Project ---------------- */
+app.post(
+  "/api/projects",
+  simpleAuth,
+  upload.single("videoFile"),
+  async (req, res) => {
+    const { title, youtubeUrl } = req.body;
+    const videoFile = req.file;
+
+    if (!videoFile && !youtubeUrl) {
+      return res.status(400).json({ message: "No input provided" });
+    }
+
+    const projectId = `proj-${Date.now()}`;
+    const userId = (req as any).user.id;
+    let sourcePath = "";
+    let tempVideoPath: string | null = null;
+
+    try {
+      /* -------- Source -------- */
+      if (videoFile) {
+        sourcePath = videoFile.path;
+      } else {
+        if (!/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//.test(youtubeUrl)) {
+          throw new Error("Invalid YouTube URL");
+        }
+
+        const outputTemplate = path.join(uploadDir, `${projectId}.%(ext)s`);
+        const timeoutMs = 120_000;
+
+        tempVideoPath = await new Promise<string>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("YouTube download timed out")),
+            timeoutMs
+          );
+
+          ytDlpWrap
+            .exec([
+              youtubeUrl,
+              "-f",
+              "best[ext=mp4]/best",
+              "-o",
+              outputTemplate,
+            ])
+            .on("close", (code) => {
+              clearTimeout(timeout);
+              if (code !== 0) return reject(new Error("yt-dlp failed"));
+
+              const files = fs
+                .readdirSync(uploadDir)
+                .filter((f) => f.startsWith(projectId + "."));
+
+              if (!files.length) return reject(new Error("No output file"));
+
+              resolve(path.join(uploadDir, files[0]));
+            })
+            .on("error", (err) => {
+              clearTimeout(timeout);
+              reject(err);
+            });
+        });
+
+        sourcePath = tempVideoPath;
+      }
+
+      /* -------- Create project -------- */
+      const project: Project = {
+        id: projectId,
+        userId,
+        title: title || "Untitled",
+        fileName: path.basename(sourcePath),
+        status: "processing",
+        clips: [],
+        createdAt: new Date(),
+      };
+      projects.push(project);
+      res.status(201).json(project);
+
+      /* -------- Processing -------- */
+      const duration = await getVideoDuration(sourcePath);
+
+      const clips = [
+        { title: "Clip 1", start: 0, end: Math.min(20, duration) },
+        { title: "Clip 2", start: 20, end: Math.min(40, duration) },
+      ];
+
+      const finalClips: Clip[] = [];
+
+      for (const c of clips) {
+        const clipId = `clip-${Date.now()}-${Math.random()}`;
+        const outFile = `${projectId}-${clipId}.mp4`;
+        const outPath = path.join(uploadDir, outFile);
+
+        await new Promise<void>((resolve, reject) => {
+          ffmpeg(sourcePath)
+            .setStartTime(c.start)
+            .setDuration(c.end - c.start)
+            .outputOptions("-preset veryfast")
+            .output(outPath)
+            .on("end", resolve)
+            .on("error", reject)
+            .run();
+        });
+
+        finalClips.push({
+          id: clipId,
+          projectId,
+          title: c.title,
+          start: c.start,
+          end: c.end,
+          url: `/uploads/${outFile}`,
+        });
+      }
+
+      project.status = "completed";
+      project.clips = finalClips;
+    } catch (err: any) {
+      const p = projects.find((x) => x.id === projectId);
+      if (p) {
+        p.status = "failed";
+        p.errorMessage = err.message;
+      }
+    } finally {
+      if (tempVideoPath && fs.existsSync(tempVideoPath)) {
+        fs.unlinkSync(tempVideoPath);
+      }
+    }
+  }
+);
+
+/* ---------------- Start ---------------- */
+if (process.env.NODE_ENV !== "test") {
+  app.listen(port, () =>
+    console.log(`Backend server running on http://localhost:${port}`)
+  );
 }
 
 export default app;
